@@ -8,7 +8,7 @@
 docker compose up --build
 ```
 
-一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录表、快照导出表)在启动时自动创建/升级,无需手工初始化。
+一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录表、快照导出表、事件日计数视图两张表)在启动时自动创建/升级,无需手工初始化。
 
 不用 compose 也可以:
 
@@ -421,6 +421,50 @@ curl -X DELETE http://localhost:8000/exports/1
 
 未知或已删除的快照,`GET /exports/{id}/events` 与 `DELETE /exports/{id}` 统一返回 **404**;删除不影响其他快照。
 
+### 12. 事件日计数视图
+
+可以为一组关注条件创建**日计数视图**:按 `occurred_at` 的 **UTC 日期**分桶,实时统计当前 `events` 表内匹配的现存事件,返回各日计数与总数。创建请求只有一个必填字段 `name`(唯一),以及可选的 `matches`——payload **顶层"字符串字段 = 字符串值"**的等值条件(多个条件为 AND;省略或传 `{}` 表示无条件统计全部事件):
+
+```bash
+curl -X POST http://localhost:8000/count-views \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"orders-2026","matches":{"type":"order"}}'
+```
+
+```json
+{
+  "name": "orders-2026",
+  "matches": {"type": "order"},
+  "created_at": "2026-09-27T08:00:00.000000+00:00",
+  "days": [
+    {"day": "2026-09-25", "count": 120},
+    {"day": "2026-09-26", "count": 340}
+  ],
+  "total": 460
+}
+```
+
+- **创建即回填**:`POST /count-views` 在**同一个写事务**(`BEGIN IMMEDIATE`)内"保存规则 → 扫描当前 `events` 表回填计数",与事件接收、压缩归档串行,回填结果与事务提交时刻的现存事件一致;已被压缩归档删除的历史不计入(视图只反映现存事件)。
+- **实时维护**:之后单条与批量接收只对**真正新建**的事件计数——重复 `event_id`(库中已有或批内重复)不计数,与接收接口的幂等语义完全一致;迟到事件按其 **`occurred_at` 发生日期**归桶,而不是接收日期。
+- **压缩同步扣减**:`/retention/compact` 物理删除事件时在**同一事务**内按发生日期扣减各视图,计数归零的**空桶立即移除**(响应里不会出现 `count: 0` 的日期);视图创建晚于压缩时,只统计当时还在表里的事件。
+- **匹配规则**:`matches` 的每个值都必须是**字符串**,字段缺失或实际值不是字符串(数字、布尔、嵌套对象等)都不命中;只比较 payload 顶层字段,不做嵌套/路径匹配。规则上限 20 个字段,字段名 1~255 字符、值最长 1000 字符,非法请求返回 **422**。
+
+按名称查询视图(返回体与创建时一致):
+
+```bash
+curl http://localhost:8000/count-views/orders-2026
+```
+
+删除视图(规则与全部日计数桶在**同一事务**内原子删除):
+
+```bash
+curl -X DELETE http://localhost:8000/count-views/orders-2026
+# => {"name": "orders-2026", "deleted": true}
+```
+
+- 重复 `name` 创建返回 **409** `{"detail":"count view name already exists","name":...}`,不建视图也不回填;
+- 查询或删除未知视图统一返回 **404**;删除不影响其他视图与事件本身。
+
 ## 哈希链规范
 
 每条记录写入时在同一事务内计算并存储两个字段:
@@ -451,6 +495,7 @@ curl -X DELETE http://localhost:8000/exports/1
 - **毒丸隔离**:`POST /consumers/{consumer_id}/quarantine` 在单个 `BEGIN IMMEDIATE` 事务内完成"核对令牌(与 `ack` 同套:无租约/过期/旧令牌 409)→ 核对租约起点与游标相邻(考虑链锚点)→ 复制首条事件完整内容、原哈希与非空原因到独立 `quarantined_events` 表 → 游标仅越过这一条并清除整批租约"。下次 `pull` 重新租用剩余事件并换发新 token,旧令牌立即作废;失败原因空白返回 422。`GET /consumers/{consumer_id}/quarantine` 分页查看隔离记录;副本独立于原事件存储,原事件被压缩归档(物理删除)后仍可查看。隔离会把游标推进过该事件,因此被隔离事件视为"已处理",可正常纳入安全归档,内容由隔离副本留存。
 - **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
 - **持久化快照导出**:`POST /exports` 在单个 `BEGIN IMMEDIATE` 事务内完成"读链锚点 → 写快照元数据(锚点 seq/hash、末尾 seq、总数)→ `INSERT ... SELECT` 整体复制当前全部未压缩事件到 `export_events`",与事件写入、压缩归档串行,副本与元数据来自同一时刻。副本落库后不可变:`GET /exports/{id}/events` 只查快照表,按 `(snapshot_id, seq)` 主键升序分页(多取一条判断 `next_after_seq`,末页为 `null`),后续写入/压缩/重启均不影响;`after_seq` 越出 `[anchor_seq, end_seq]` 返回 422。`DELETE /exports/{id}` 在同一事务内删除元数据与全部副本,未知或已删除统一 404。
+- **事件日计数视图**:`count_views`(唯一名称 + 固定 JSON 等值规则)与 `count_view_days`(`(view_id, day)` 主键的计数桶)两表支撑。`POST /count-views` 在单个 `BEGIN IMMEDIATE` 事务内保存规则并扫描现存事件回填(只含当前 `events` 表,已压缩历史不计入);单条/批量接收在各自写事务内、仅对真正新建的事件按"命中视图 → UTC 日期"聚合后 upsert(重复 `event_id` 在判重阶段已被排除,绝不重复计数);压缩归档在删除前缀的同一事务内按相同规则扣减并 `DELETE` 归零空桶。桶键取归一化后 `occurred_at` 的 UTC 日期前 10 字符,时区在存储前已转换,迟到事件自然归入发生日。重复名称 409,未知视图查询/删除 404。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
 
 ## API 一览
@@ -472,6 +517,9 @@ curl -X DELETE http://localhost:8000/exports/1
 | POST | `/exports` | 创建持久化快照:单事务复制全部未压缩事件与链锚点,返回快照 ID、锚点 seq/hash、末尾 seq 与总数 |
 | GET | `/exports/{id}/events` | 按原 `seq` 升序分页读取快照副本(`after_seq` 默认锚点序号,限 `[anchor_seq, end_seq]` 否则 422;`limit` 1~1000;`next_after_seq` 末页为 null) |
 | DELETE | `/exports/{id}` | 单事务原子删除快照元数据与全部副本;未知或已删除统一 404 |
+| POST | `/count-views` | 创建事件日计数视图(唯一 `name` + 可选 payload 顶层字符串字段等值条件 `matches`):单事务保存规则并回填现存事件;重复名称 409 |
+| GET | `/count-views/{name}` | 查询视图:返回规则、创建时间、按 UTC 日期升序的各日计数及总数;未知 404 |
+| DELETE | `/count-views/{name}` | 单事务删除视图规则与全部日计数桶;未知 404 |
 | GET | `/health` | 健康检查 |
 
 交互式文档:启动后访问 `http://localhost:8000/docs`。

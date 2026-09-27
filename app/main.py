@@ -6,9 +6,18 @@ from typing import Any, Optional
 
 from fastapi import Body, FastAPI, Path, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictStr, field_validator
 
 from .chain import record_hash
+from .countviews import (
+    MAX_FIELD_NAME_LEN,
+    MAX_FIELD_VALUE_LEN,
+    MAX_MATCH_FIELDS,
+    apply_events as apply_view_events,
+    backfill_view,
+    get_view,
+    load_views,
+)
 from .db import get_chain_anchor, get_conn, init_db
 
 app = FastAPI(title="Webhook Event Receiver & Replay")
@@ -66,6 +75,37 @@ class QuarantineIn(BaseModel):
     def reason_not_blank(cls, v: str) -> str:
         if not v.strip():
             raise ValueError("reason must not be blank")
+        return v
+
+
+class CountViewIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    # 可选: payload 顶层"字符串字段 = 字符串值"等值条件; 缺省/空对象表示无条件统计全部事件
+    matches: dict[str, StrictStr] = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def name_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("name must not be blank")
+        return v
+
+    @field_validator("matches")
+    @classmethod
+    def matches_limits(cls, v: dict[str, str]) -> dict[str, str]:
+        # 空条件({})合法: 统计全部事件
+        if len(v) > MAX_MATCH_FIELDS:
+            raise ValueError(f"at most {MAX_MATCH_FIELDS} match fields")
+        for field in v:
+            # 字段名不允许空白键; 空字符串值合法(就是匹配空串)
+            if not field or len(field) > MAX_FIELD_NAME_LEN:
+                raise ValueError(
+                    f"match field name must be 1~{MAX_FIELD_NAME_LEN} chars"
+                )
+            if len(v[field]) > MAX_FIELD_VALUE_LEN:
+                raise ValueError(
+                    f"match value must be at most {MAX_FIELD_VALUE_LEN} chars"
+                )
         return v
 
 
@@ -193,6 +233,11 @@ def create_event(event: EventIn):
                 received_at=received_at,
                 prev_hash=prev_hash,
             )
+            # 仅真正新建的事件到达这里(重复 event_id 走下方 IntegrityError 分支),
+            # 在同一事务内更新各日计数视图
+            apply_view_events(
+                conn, load_views(conn), [(occurred_at, event.payload)], 1
+            )
     except sqlite3.IntegrityError:
         # event_id 已存在 -> 幂等返回, 不写入重复记录, 链保持不变
         return JSONResponse(
@@ -237,6 +282,9 @@ def create_events_batch(
             }
             seen: set[str] = set(existing)
             prev_hash = current_chain_head(conn)
+            # 仅收集真正新建的事件(库中已有/批内重复均不入表也不进视图),
+            # 循环后在同一事务内一次性更新全部日计数视图
+            new_events: list[tuple[str, Any]] = []
 
             for event_id, occurred_at, payload in normalized:
                 if event_id in seen:
@@ -257,7 +305,11 @@ def create_events_batch(
                 prev_hash = h
                 seen.add(event_id)
                 created += 1
+                new_events.append((occurred_at, payload))
                 results.append({"event_id": event_id, "status": "created", "seq": seq})
+
+            # 重复 event_id 不计数: 只有 new_events 中的新建条目参与
+            apply_view_events(conn, load_views(conn), new_events, 1)
         except sqlite3.IntegrityError:
             # 并发兜底: 批量不接受"部分写入", 回滚整批, 不留下任何新事件
             conn.rollback()
@@ -826,7 +878,8 @@ def compact(req: CompactIn):
 
         # 连续前缀: 从锚点后一条起逐条连续, 遇断档即止
         rows = conn.execute(
-            "SELECT id, hash FROM events WHERE id > ? AND id <= ? ORDER BY id",
+            "SELECT id, hash, occurred_at, payload FROM events"
+            " WHERE id > ? AND id <= ? ORDER BY id",
             (anchor_seq, req.cutoff_seq),
         ).fetchall()
         prefix: list[sqlite3.Row] = []
@@ -852,6 +905,12 @@ def compact(req: CompactIn):
             }
 
         if prefix:
+            # 同一事务内先按被删事件的发生日期扣减各日计数视图(归零空桶移除),
+            # 再物理删除事件并持久化链锚点
+            deleted_events = [
+                (r["occurred_at"], json.loads(r["payload"])) for r in prefix
+            ]
+            apply_view_events(conn, load_views(conn), deleted_events, -1)
             conn.execute(
                 "DELETE FROM events WHERE id BETWEEN ? AND ?",
                 (from_seq, through_seq),
@@ -1050,3 +1109,77 @@ def delete_export(export_id: int = Path(...)):
         conn.execute("DELETE FROM export_events WHERE snapshot_id = ?", (export_id,))
         conn.execute("DELETE FROM export_snapshots WHERE id = ?", (export_id,))
     return {"export_id": export_id, "deleted": True}
+
+
+# ---------- count views: 事件日计数视图 ----------
+
+@app.post("/count-views", status_code=201)
+def create_count_view(view: CountViewIn):
+    """创建事件日计数视图并在同一写事务内回填当前 events 表的匹配事件。
+
+    - name 唯一: 重复名称报冲突(409), 不建表也不回填。
+    - matches 为可选的 payload 顶层"字符串字段 = 字符串值"等值条件,
+      省略或传 {} 表示无条件统计全部事件; 值必须是字符串(类型不符 422)。
+    - 回填只统计当前现存事件: 已经被压缩归档删除的历史不计数, 与后续实时
+      维护保持同一口径; 之后单条/批量接收只对真正新建的事件 +1,
+      压缩归档删除在同一事务内 -1 并移除空桶。
+    - 桶按 occurred_at 的 UTC 日期划分, 迟到事件归入其发生日期。
+    """
+    created_at = utc_now()
+    rules_json = json.dumps(view.matches, ensure_ascii=False, sort_keys=True)
+    with get_conn() as conn:
+        try:
+            # BEGIN IMMEDIATE: "查重 -> 建规则 -> 回填现存事件"原子完成,
+            # 与事件接收/压缩串行, 回填结果与事务提交时刻的 events 表一致
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "INSERT INTO count_views (name, match_rules, created_at)"
+                " VALUES (?, ?, ?)",
+                (view.name, rules_json, created_at),
+            )
+            view_id = cur.lastrowid
+            backfill_view(conn, view_id, view.matches)
+            result = get_view(conn, view.name)
+        except sqlite3.IntegrityError:
+            # name 上的 UNIQUE 约束: 重复名称报冲突, 回滚事务不留下任何写入
+            conn.rollback()
+            return JSONResponse(
+                status_code=409,
+                content={"detail": "count view name already exists", "name": view.name},
+            )
+    return result
+
+
+@app.get("/count-views/{name}")
+def read_count_view(name: str = Path(..., min_length=1, max_length=255)):
+    """按名称查询视图: 返回规则、创建时间、各 UTC 日计数(日期升序)及总数。"""
+    with get_conn() as conn:
+        result = get_view(conn, name)
+    if result is None:
+        return JSONResponse(
+            status_code=404, content={"detail": "count view not found", "name": name}
+        )
+    return result
+
+
+@app.delete("/count-views/{name}")
+def delete_count_view(name: str = Path(..., min_length=1, max_length=255)):
+    """删除视图: 同一事务内原子删除规则与全部日计数桶。
+
+    未知或已删除的视图统一返回 404, 状态不变。
+    """
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        view = conn.execute(
+            "SELECT id FROM count_views WHERE name = ?", (name,)
+        ).fetchone()
+        if view is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "count view not found", "name": name},
+            )
+        conn.execute(
+            "DELETE FROM count_view_days WHERE view_id = ?", (view["id"],)
+        )
+        conn.execute("DELETE FROM count_views WHERE id = ?", (view["id"],))
+    return {"name": name, "deleted": True}
