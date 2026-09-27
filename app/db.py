@@ -71,6 +71,20 @@ CREATE TABLE IF NOT EXISTS export_events (
     hash        TEXT,
     PRIMARY KEY (snapshot_id, seq)                  -- 按原 seq 升序分页
 );
+
+CREATE TABLE IF NOT EXISTS count_views (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,  -- 视图 ID
+    name       TEXT NOT NULL UNIQUE,               -- 客户端指定的唯一视图名
+    filters    TEXT NOT NULL,                      -- JSON 对象: payload 顶层字符串字段等值条件, 空对象表示不过滤
+    created_at TEXT NOT NULL                       -- 创建时间(UTC ISO8601)
+);
+
+CREATE TABLE IF NOT EXISTS count_view_buckets (
+    view_id INTEGER NOT NULL,                      -- 所属视图(随视图删除同事务清除)
+    day     TEXT NOT NULL,                         -- UTC 日期 YYYY-MM-DD(按 occurred_at 分桶)
+    count   INTEGER NOT NULL,                      -- 该日匹配的现存事件数(空桶即删, 恒 > 0)
+    PRIMARY KEY (view_id, day)
+);
 """
 
 

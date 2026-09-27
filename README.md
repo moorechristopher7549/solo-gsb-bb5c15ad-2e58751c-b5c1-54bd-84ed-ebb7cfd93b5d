@@ -1,6 +1,6 @@
 # Webhook 事件接收与重放 API
 
-基于 FastAPI + SQLite 的 Webhook 事件接收服务:按 `event_id` 幂等接收(支持单条与 1~1000 条批量、同一写事务续接哈希链)、记录首次接收顺序,支持时间范围分页查询与批量重放。
+基于 FastAPI + SQLite 的 Webhook 事件接收服务:按 `event_id` 幂等接收(支持单条与 1~1000 条批量、同一写事务续接哈希链)、记录首次接收顺序,支持时间范围分页查询与批量重放,并可创建按 UTC 日期分桶的事件计数视图。
 
 ## 启动
 
@@ -8,7 +8,7 @@
 docker compose up --build
 ```
 
-一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录表、快照导出表)在启动时自动创建/升级,无需手工初始化。
+一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录表、快照导出表、日计数视图表)在启动时自动创建/升级,无需手工初始化。
 
 不用 compose 也可以:
 
@@ -421,6 +421,49 @@ curl -X DELETE http://localhost:8000/exports/1
 
 未知或已删除的快照,`GET /exports/{id}/events` 与 `DELETE /exports/{id}` 统一返回 **404**;删除不影响其他快照。
 
+### 12. 事件日计数视图
+
+按 `occurred_at` 的 **UTC 日期**分桶统计事件数的物化视图:创建时指定**唯一名称**和可选的 **payload 顶层字符串字段等值条件**,创建在**同一写事务**内回填现存事件并保存规则;之后单条/批量接收只对**真正新建**的事件增量更新(重复 `event_id` 不重复计数),归档压缩删除事件时在**同一事务**内扣减对应日期计数(空桶移除),迟到事件归入其发生日期。视图始终只反映**当前 events 表**内的匹配事件。
+
+```bash
+# 创建视图(不过滤可省略 filters 或传 {})
+curl -X POST http://localhost:8000/views \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"signup-ios","filters":{"type":"signup","platform":"ios"}}'
+```
+
+```json
+{
+  "name": "signup-ios",
+  "filters": {"type": "signup", "platform": "ios"},
+  "created_at": "2026-09-27T08:00:00.000000+00:00",
+  "days": [
+    {"day": "2026-09-18", "count": 2},
+    {"day": "2026-09-19", "count": 1}
+  ],
+  "total": 3
+}
+```
+
+- **匹配规则**:`filters` 中每个键值对都要求事件 `payload` **顶层同名字段为字符串且相等**;非字符串值(数字、布尔、嵌套对象)不匹配字符串条件。`filters` 为空对象时统计全部事件;条件最多 50 个,字段名不可为空白。
+- **重名创建**返回 **409** `view name already exists`,不覆盖已有视图;名称空白、过滤值非字符串等由请求校验拦截(**422**)。
+- **分桶**:按归一化后的 UTC `occurred_at` 取 `YYYY-MM-DD`,与接收时间无关——迟到事件按其发生日期归桶;带时区偏移的时间(如 `+08:00`)先换算成 UTC 再分桶。
+
+按名称查询视图(各日计数按日期升序,附总数):
+
+```bash
+curl http://localhost:8000/views/signup-ios
+```
+
+删除视图(规则与全部日桶在**同一事务**内原子删除):
+
+```bash
+curl -X DELETE http://localhost:8000/views/signup-ios
+# => {"name": "signup-ios", "deleted": true}
+```
+
+未知名称的查询与删除统一返回 **404**;删除不影响事件本身与其他视图。
+
 ## 哈希链规范
 
 每条记录写入时在同一事务内计算并存储两个字段:
@@ -451,6 +494,7 @@ curl -X DELETE http://localhost:8000/exports/1
 - **毒丸隔离**:`POST /consumers/{consumer_id}/quarantine` 在单个 `BEGIN IMMEDIATE` 事务内完成"核对令牌(与 `ack` 同套:无租约/过期/旧令牌 409)→ 核对租约起点与游标相邻(考虑链锚点)→ 复制首条事件完整内容、原哈希与非空原因到独立 `quarantined_events` 表 → 游标仅越过这一条并清除整批租约"。下次 `pull` 重新租用剩余事件并换发新 token,旧令牌立即作废;失败原因空白返回 422。`GET /consumers/{consumer_id}/quarantine` 分页查看隔离记录;副本独立于原事件存储,原事件被压缩归档(物理删除)后仍可查看。隔离会把游标推进过该事件,因此被隔离事件视为"已处理",可正常纳入安全归档,内容由隔离副本留存。
 - **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
 - **持久化快照导出**:`POST /exports` 在单个 `BEGIN IMMEDIATE` 事务内完成"读链锚点 → 写快照元数据(锚点 seq/hash、末尾 seq、总数)→ `INSERT ... SELECT` 整体复制当前全部未压缩事件到 `export_events`",与事件写入、压缩归档串行,副本与元数据来自同一时刻。副本落库后不可变:`GET /exports/{id}/events` 只查快照表,按 `(snapshot_id, seq)` 主键升序分页(多取一条判断 `next_after_seq`,末页为 `null`),后续写入/压缩/重启均不影响;`after_seq` 越出 `[anchor_seq, end_seq]` 返回 422。`DELETE /exports/{id}` 在同一事务内删除元数据与全部副本,未知或已删除统一 404。
+- **事件日计数视图**:规则存 `count_views`(名称 `UNIQUE`,重名 409),日桶计数存 `count_view_buckets`(`(view_id, day)` 主键)。`POST /views` 在单个 `BEGIN IMMEDIATE` 事务内"保存规则 → 全量扫描现存事件按 UTC 日期回填";`/events` 与 `/events/batch` 只对真正新建的条目逐视图匹配增量 +1(重复 `event_id` 走幂等分支,不动视图);`/retention/compact` 在同一事务内对被删前缀逐条扣减并移除空桶——因此视图始终等于"当前 events 表内匹配事件按发生日期的计数",迟到事件按 `occurred_at` 归其发生日期。`GET /views/{name}` 按名称返回各日计数与总数,`DELETE /views/{name}` 单事务删除规则与日桶,未知名称均 404。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
 
 ## API 一览
@@ -472,6 +516,9 @@ curl -X DELETE http://localhost:8000/exports/1
 | POST | `/exports` | 创建持久化快照:单事务复制全部未压缩事件与链锚点,返回快照 ID、锚点 seq/hash、末尾 seq 与总数 |
 | GET | `/exports/{id}/events` | 按原 `seq` 升序分页读取快照副本(`after_seq` 默认锚点序号,限 `[anchor_seq, end_seq]` 否则 422;`limit` 1~1000;`next_after_seq` 末页为 null) |
 | DELETE | `/exports/{id}` | 单事务原子删除快照元数据与全部副本;未知或已删除统一 404 |
+| POST | `/views` | 创建事件日计数视图(唯一名称 + 可选 payload 顶层字符串字段等值条件):单事务回填现存事件,按 UTC 日期分桶;重名 409 |
+| GET | `/views/{name}` | 按名称查询视图:各 UTC 日计数(升序)及总数;未知名称 404 |
+| DELETE | `/views/{name}` | 单事务删除视图规则与全部日桶;未知名称 404 |
 | GET | `/health` | 健康检查 |
 
 交互式文档:启动后访问 `http://localhost:8000/docs`。
